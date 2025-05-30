@@ -1,0 +1,3 @@
+# `datamol.align`
+
+::: datamol.align
