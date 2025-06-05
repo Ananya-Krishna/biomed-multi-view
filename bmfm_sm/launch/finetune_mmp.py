@@ -1,11 +1,12 @@
 import click
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 import pandas as pd
 import os
 import numpy as np
 from tqdm import tqdm
+from collections import defaultdict
 
 from bmfm_sm.api.smmv_api import SmallMoleculeMultiViewModel, LateFusionStrategy
 from bmfm_sm.predictive.data_modules.graph_finetune_dataset import Graph2dFinetuneDataPipeline
@@ -54,12 +55,9 @@ def main(model_path, batch_size, lr, epochs, output_dir, pos_csv, neg_csv):
     backbone = SmallMoleculeMultiViewModel.from_pretrained(
         model_path=model_path,
         fusion_strategy=LateFusionStrategy.ATTENTIONAL,  # Using the default strategy
-        inference_mode=False,
+        inference_mode=True,  # Set to True since we're only using it for inference
         huggingface=True,
     )
-    # Freeze the backbone
-    for p in backbone.parameters():
-        p.requires_grad = False
     backbone.to(device)
     backbone.eval()
 
@@ -80,15 +78,40 @@ def main(model_path, batch_size, lr, epochs, output_dir, pos_csv, neg_csv):
         else:
             return output.squeeze()
 
-    # Infer embedding dimension dynamically via a dummy pass
+    # 3) First, collect all unique SMILES from both datasets
+    print("Reading CSV files...")
+    df_pos = pd.read_csv(pos_csv)
+    df_neg = pd.read_csv(neg_csv)
+    
+    # Extract SMILES pairs
+    pos_pairs = list(zip(df_pos.iloc[:, 0], df_pos.iloc[:, 2]))
+    neg_pairs = list(zip(df_neg.iloc[:, 0], df_neg.iloc[:, 2]))
+    all_pairs = pos_pairs + neg_pairs
+    
+    # Get unique SMILES across all pairs
+    unique_smiles = set()
+    for a, b in all_pairs:
+        unique_smiles.add(a)
+        unique_smiles.add(b)
+    
+    unique_smiles = list(unique_smiles)
+    print(f"Found {len(unique_smiles)} unique molecules")
+    
+    # 4) Precompute embeddings for all unique SMILES (only once)
+    print("Precomputing embeddings for all molecules (this may take a while)...")
+    
+    # Use a dictionary to map SMILES to their embeddings
+    embedding_cache = {}
+    
     with torch.no_grad():
-        # Get a full multimodal embedding for a dummy SMILES
-        dummy_emb = get_embedding("CC", backbone)
-        embedding_dim = dummy_emb.size(-1)
-
-    print(f"Inferred embedding dimension: {embedding_dim}")
-
-    # 3) Build projection head on top of embeddings
+        for smiles in tqdm(unique_smiles, desc="Computing embeddings"):
+            embedding_cache[smiles] = get_embedding(smiles, backbone).cpu()
+    
+    # Infer embedding dimension from the cached embeddings
+    embedding_dim = next(iter(embedding_cache.values())).size(-1)
+    print(f"Embedding dimension: {embedding_dim}")
+    
+    # 5) Build projection head on top of embeddings
     proj_head = nn.Sequential(
         nn.Linear(embedding_dim, 256),
         nn.ReLU(),
@@ -97,111 +120,87 @@ def main(model_path, batch_size, lr, epochs, output_dir, pos_csv, neg_csv):
 
     optimizer = torch.optim.Adam(proj_head.parameters(), lr=lr)
     criterion = NTXentLoss(temperature=0.5)
-
-    class MMPDataset(Dataset):
-        """Load all SMILES pairs without any graph filtering."""
-        def __init__(self, pos_csv, neg_csv):
-            df1 = pd.read_csv(pos_csv)
-            df2 = pd.read_csv(neg_csv)
-            pos_pairs = list(zip(df1.iloc[:, 0], df1.iloc[:, 2]))
-            neg_pairs = list(zip(df2.iloc[:, 0], df2.iloc[:, 2]))
-            self.pairs = pos_pairs + neg_pairs
-            # Store which pairs are positive (1) vs negative (0)
-            self.labels = [1] * len(pos_pairs) + [0] * len(neg_pairs)
-
+    
+    # 6) Create dataset using precomputed embeddings
+    class CachedEmbeddingDataset(Dataset):
+        def __init__(self, pairs, labels, embedding_cache):
+            self.pairs = pairs
+            self.labels = labels
+            self.embedding_cache = embedding_cache
+            
         def __len__(self):
             return len(self.pairs)
-
-        def __getitem__(self, i):
-            a, b = self.pairs[i]
-            return {"smiles_A": a, "smiles_B": b, "label": self.labels[i]}
-
-    loader = DataLoader(
-        MMPDataset(pos_csv, neg_csv),
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
-    print(f"Starting training for {epochs} epochs...")
-    # 4) Training loop: full multimodal finetuning
+            
+        def __getitem__(self, idx):
+            smiles_a, smiles_b = self.pairs[idx]
+            label = self.labels[idx]
+            
+            emb_a = self.embedding_cache[smiles_a]
+            emb_b = self.embedding_cache[smiles_b]
+            
+            return {
+                'emb_a': emb_a,
+                'emb_b': emb_b,
+                'label': label,
+                'smiles_a': smiles_a,
+                'smiles_b': smiles_b
+            }
+    
+    # Create labels for pairs
+    pair_labels = [1] * len(pos_pairs) + [0] * len(neg_pairs)
+    
+    # Create dataset with cached embeddings
+    dataset = CachedEmbeddingDataset(all_pairs, pair_labels, embedding_cache)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    # 7) Train the projection head only
+    print(f"Training projection head for {epochs} epochs...")
     for epoch in tqdm(range(epochs), desc="Epochs"):
         total_loss = 0.0
-        for batch in tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
-            smiles_A = batch["smiles_A"]
-            smiles_B = batch["smiles_B"]
-            labels = batch["label"]
-
-            # Get embeddings from the frozen backbone
-            with torch.no_grad():
-                # Get embeddings for batch A
-                embeddings_A = torch.stack([
-                    get_embedding(smiles, backbone).to(device)
-                    for smiles in tqdm(smiles_A, desc="Processing A", leave=False)
-                ])
-                
-                # Get embeddings for batch B
-                embeddings_B = torch.stack([
-                    get_embedding(smiles, backbone).to(device)
-                    for smiles in tqdm(smiles_B, desc="Processing B", leave=False)
-                ])
-
-            # Project & compute contrastive loss
-            z1 = proj_head(embeddings_A)  # (B, 128)
-            z2 = proj_head(embeddings_B)  # (B, 128)
+        
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
+            # Get embeddings from cache
+            embeddings_A = batch['emb_a'].to(device)
+            embeddings_B = batch['emb_b'].to(device)
+            labels = batch['label']
             
-            # Apply contrastive loss
+            # Project embeddings
+            z1 = proj_head(embeddings_A)
+            z2 = proj_head(embeddings_B)
+            
+            # Compute contrastive loss
             loss = criterion(z1, z2)
-
+            
+            # Backpropagation
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            
             total_loss += loss.item()
-
-        avg_loss = total_loss / len(loader)
+        
+        avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} — avg loss: {avg_loss:.4f}")
-
-    # Save the projection head
+    
+    # 8) Save the projection head and embeddings
     model_path = os.path.join(output_dir, "mmp_projection_head.pth")
     torch.save(proj_head.state_dict(), model_path)
     print(f"Training complete. Projection head saved to {model_path}")
     
-    # Generate and save embeddings for a sample of molecules
-    print("Generating embeddings for sample molecules...")
+    # 9) Generate and save both original and projected embeddings
+    print("Saving original and projected embeddings...")
     
-    # Create a dataset reader to get all unique SMILES
-    df_pos = pd.read_csv(pos_csv)
-    df_neg = pd.read_csv(neg_csv)
+    # Convert embedding cache to arrays for saving
+    smiles_list = list(embedding_cache.keys())
+    original_embeddings = np.stack([embedding_cache[s].numpy() for s in smiles_list])
     
-    # Get unique SMILES from both files
-    all_smiles = set()
-    for df in [df_pos, df_neg]:
-        all_smiles.update(df.iloc[:, 0])
-        all_smiles.update(df.iloc[:, 2])
-    
-    all_smiles = list(all_smiles)
-    print(f"Found {len(all_smiles)} unique molecules")
-    
-    # Limit to 1000 molecules if there are too many
-    if len(all_smiles) > 1000:
-        all_smiles = all_smiles[:1000]
-        print(f"Limiting to first 1000 molecules")
-    
-    # Generate embeddings
-    original_embeddings = []
+    # Generate projected embeddings
     projected_embeddings = []
-    
     with torch.no_grad():
-        for smiles in tqdm(all_smiles, desc="Generating embeddings"):
-            # Get original embedding
-            emb = get_embedding(smiles, backbone).cpu()
-            original_embeddings.append(emb.numpy())
-            
-            # Get projected embedding
-            proj_emb = proj_head(emb.to(device)).cpu().numpy()
+        for smiles in tqdm(smiles_list, desc="Generating projected embeddings"):
+            emb = embedding_cache[smiles].to(device)
+            proj_emb = proj_head(emb).cpu().numpy()
             projected_embeddings.append(proj_emb)
     
-    # Convert to numpy arrays
-    original_embeddings = np.array(original_embeddings)
     projected_embeddings = np.array(projected_embeddings)
     
     # Save embeddings and SMILES
@@ -210,7 +209,7 @@ def main(model_path, batch_size, lr, epochs, output_dir, pos_csv, neg_csv):
     
     # Save SMILES for reference
     with open(os.path.join(output_dir, "embedding_smiles.txt"), "w") as f:
-        for smiles in all_smiles:
+        for smiles in smiles_list:
             f.write(f"{smiles}\n")
     
     print(f"Embeddings saved to {output_dir}")
