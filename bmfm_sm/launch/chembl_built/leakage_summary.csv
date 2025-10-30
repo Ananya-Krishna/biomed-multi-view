@@ -1,0 +1,7 @@
+target,tid,n_total,n_exact,n_tani,n_any,n_no_leak
+dopamine_D2_receptor,CHEMBL217,380,52,55,55,325
+carbonic_anhydrase_II,CHEMBL205,724,84,84,84,640
+adenosine_A2a_receptor,CHEMBL251,122,20,20,20,102
+serotonin_1a_receptor,CHEMBL214,363,39,39,39,324
+coagulation_factor_X,CHEMBL244,2320,48,55,55,2265
+hERG,CHEMBL240,7331,818,840,840,6491
